@@ -7,6 +7,8 @@ from datetime import datetime
 import time
 import json
 import mysql.connector
+from itertools import combinations
+
 import pandas as pd
 import os
 # import traceback
@@ -60,8 +62,9 @@ class Lot_Aggregation(APIView):
                         print("Input =", input_json)
                         print("type =", type(input_json))
                         startTime = time.clock()
-                        if "rights" in input_json:
+                        if "lot_details" in input_json:
                             # print("YES")
+                            agf_tag = 1
                             data = pd.DataFrame(input_json["rights"])
                             lot_upper_threshold = input_json["lot_details"]["lot_upper_threshold"]
                             lot_lower_threshold = input_json["lot_details"]["lot_lower_threshold"]
@@ -69,7 +72,7 @@ class Lot_Aggregation(APIView):
                             lot_rights = pd.DataFrame(input_json["lot_details"]["lot_rights"])
                             # print("data =", data)
                             # print("lot_rights =", lot_rights)
-                            agf_tag = 1
+
                         else:
                             data = pd.json_normalize(input_json)
 
@@ -79,10 +82,17 @@ class Lot_Aggregation(APIView):
                         else:
                             obj_lot = lot_aggregation(data)
                             if agf_tag == 0:
-                                obj_lot = lot_aggregation(data)
                                 result = obj_lot.lot_aggregation_algo()
                             else:
-                                result = obj_lot.lot_agf_algo(lot_rights, lot_upper_threshold, lot_lower_threshold, lot_quantity)
+                                if lot_lower_threshold <= lot_quantity <= lot_upper_threshold:
+                                    result = obj_lot.lot_agf_algo(lot_rights, lot_upper_threshold, lot_lower_threshold,
+                                                                  lot_quantity)
+                                else:
+                                    # result = "Lot_Size_Details are not Correct"
+                                    resp = make_error_response(error="RGTERR-030",
+                                                               message="Lot_Size_Details are not Correct",
+                                                               status_code=417, url=request.build_absolute_uri())
+                                    return JsonResponse(resp)
                             print("result =", result)
                             print("Lot_Creation_Time =", round(time.clock() - startTime, 2), "seconds")
                             return JsonResponse(result, status=200, safe=False)
@@ -294,7 +304,7 @@ class lot_aggregation:
                                 quantity_list_1 = quantity_list_1[~quantity_list_1.rightId.isin(list_right)]
                             nest = min_lot_size - sum(list_quantity)
                             min_value_df = quantity_list_1[quantity_list_1.quantity >= nest].sort_values(
-                                                     by=["quantity"], ascending=True)
+                                by=["quantity"], ascending=True)
                             if len(min_value_df) > 0:
                                 min_value = min_value_df["quantity"].iloc[0]
                                 right_id_min = min_value_df["rightId"].iloc[0]
@@ -331,11 +341,14 @@ class lot_aggregation:
         return result
 
     def lot_agf_algo(self, lot_rights, upperlimit, lowerlimit, lot_quantity):
+
+        lot_data = lot_rights["rightId"].values.tolist()
+        print("lot_data =", lot_data)
         if len(self.errors) == 0:
             self.data["error"] = self.data.apply(lambda row: self.check_validation(row), axis=1)
             # self.errors.extend(self.data[self.data.error == False].error.to_list())
             self.data = self.data[self.data.error == True]
-
+            # Convert Lot Details as our required format
             rights_in_lot = lot_rights
             rights_in_lot["regionId"] = rights_in_lot["regionId"].astype(int)
             rights_in_lot["farmerRating"] = rights_in_lot["farmerRating"].astype(float)
@@ -349,95 +362,138 @@ class lot_aggregation:
             rights_in_lot["quality"] = rights_in_lot["quality"].map(
                 {"Band-I": 1, "Band-II": 2, "Band-III": 3, "Band-IV": 4, "Band-V": 5})
             rights_in_lot["rating_class"] = 0
-            rights_in_lot.loc[(self.data['farmerRating'] >= 1) & (rights_in_lot['farmerRating'] <= 2.5), "rating_class"] = 1
-            rights_in_lot.loc[(self.data['farmerRating'] > 2.5) & (rights_in_lot['farmerRating'] <= 4), "rating_class"] = 2
-            rights_in_lot.loc[(self.data['farmerRating'] > 4) & (rights_in_lot['farmerRating'] <= 6), "rating_class"] = 3
-            rights_in_lot.loc[(self.data['farmerRating'] > 6) & (rights_in_lot['farmerRating'] <= 8), "rating_class"] = 4
-            rights_in_lot.loc[(self.data['farmerRating'] > 8) & (rights_in_lot['farmerRating'] <= 12), "rating_class"] = 5
+            rights_in_lot.loc[
+                (self.data['farmerRating'] >= 1) & (rights_in_lot['farmerRating'] <= 2.5), "rating_class"] = 1
+            rights_in_lot.loc[
+                (self.data['farmerRating'] > 2.5) & (rights_in_lot['farmerRating'] <= 4), "rating_class"] = 2
+            rights_in_lot.loc[
+                (self.data['farmerRating'] > 4) & (rights_in_lot['farmerRating'] <= 6), "rating_class"] = 3
+            rights_in_lot.loc[
+                (self.data['farmerRating'] > 6) & (rights_in_lot['farmerRating'] <= 8), "rating_class"] = 4
+            rights_in_lot.loc[
+                (self.data['farmerRating'] > 8) & (rights_in_lot['farmerRating'] <= 12), "rating_class"] = 5
 
-            lot_list = rights_in_lot["rightId"].values.tolist()
-            remaining_list = []
-
+            # Create Lot Spec
             lot_specs_df = rights_in_lot.groupby(
                 ['regionId', 'commodityId', "varietyId", 'harvestWeek', "quality",
                  "rating_class", "cropType"]).sum().reset_index().rename(columns={0: 'count'})
+            print("lot_spec_df = ", lot_specs_df)
 
             lot_specs = lot_specs_df.values.tolist()[0]
             print("lot_specs =", lot_specs)
             unique_specs_updated = []
-            # This is because to maintain same structure
+            # This is because to maintain same structure of lot_spec and data's unique spec
             for unq_spc in self.unique_specs:
                 unique_specs_updated.append(unq_spc[:-1])
 
+            # Check lot_spec present in data's unique_spec
             if lot_specs[:7] in unique_specs_updated:
 
-                min_lot_size = lot_quantity - lot_specs[-1]
+                existing_quantity = lot_specs[-1]
+                # Check existing_quantity lesser than lot quantity
+                if existing_quantity < lot_quantity:
+                    min_lac_size = lot_quantity - existing_quantity
 
-                max_rights = self.reg_com[(self.reg_com.CommodityID == lot_specs[1]) &
-                                          (self.reg_com.RegionID == lot_specs[0])].MaxRigtsInLot.iloc[0]
+                    max_rights = self.reg_com[(self.reg_com.CommodityID == lot_specs[1]) &
+                                              (self.reg_com.RegionID == lot_specs[0])].MaxRigtsInLot.iloc[0]
 
-                max_rights = max_rights - len(lot_rights)
-                print("max_rights =", max_rights, "min_lot_size =", min_lot_size)
-                print("lot_list235 =", lot_list)
-                lot_data = rights_in_lot["rightId"].values.tolist()
-                list_quantity = []
-                list_right = []
-                current_spec_data = self.data[
-                    (self.data.regionId == lot_specs[0]) & (self.data.commodityId == lot_specs[1]) &
-                    (self.data.varietyId == lot_specs[2]) & (self.data.harvestWeek == lot_specs[3]) &
-                    (self.data.quality == lot_specs[4]) & (self.data.rating_class == lot_specs[5])]
-                # print("current_spec_data =", current_spec_data)
-                quantity_list = current_spec_data.sort_values(by=["quantity"], ascending=False)
-                print("quantity_list1 =", quantity_list.iloc[:, :9])
-                # Rights whose quantity is equal to max_rights
-                right_df = current_spec_data[(current_spec_data["quantity"] == min_lot_size)]
-                print("right_df = ", right_df["quantity"])
-                if len(right_df) > 0:
-                    for data_1 in right_df.itertuples():
-                        if lot_list.count(data_1.rightId) > 0:
-                            continue
-                        elif sum(list_quantity) < min_lot_size and len(list_quantity) <= max_rights:
-                            list_right.append(data_1.rightId)
-                            list_quantity.append(data_1.quantity)
-                            lot_list.append(data_1.rightId)
-                            break
-                    if len(list_right) > 0 and sum(list_quantity) >= min_lot_size:
-                        # lot_data.append(list_right)
-                        lot_data.extend(list_right)
+                    max_rights = max_rights - len(lot_rights)  # Validation may require
+                    print("max_rights =", max_rights, "min_lac_size =", min_lac_size)
 
-                else:
-                    # Rights those are not operated yet
-                    quantity_list = quantity_list[~quantity_list["rightId"].isin(lot_list)]
-                    print("quantity_list2 =", quantity_list[['rightId', 'quantity']])
-                    min_range = min_lot_size - lowerlimit
-                    max_range = min_lot_size + upperlimit
-                    print("min =", min_range, "max =", max_range)
-                    # Take only those Rights whose quantity in range
-                    quantity_list_1 = quantity_list[(min_range <= quantity_list.quantity) &
-                                                    (quantity_list.quantity <= max_range)]
-                    print("quantity_list_1_RANGE =", quantity_list_1[['rightId', 'quantity']])
-                    if len(quantity_list_1) > 0:
-                        for items in quantity_list_1.itertuples():
-                            if lot_list.count(items.rightId) > 0:
-                                continue
-                            elif sum(list_quantity) < max_range and len(list_quantity) <= max_rights:
-                                list_right.append(items.rightId)
-                                list_quantity.append(items.quantity)
-                                lot_list.append(items.rightId)
+                    if max_rights > 0:
+                        current_spec_data = self.data[
+                            (self.data.regionId == lot_specs[0]) & (self.data.commodityId == lot_specs[1]) &
+                            (self.data.varietyId == lot_specs[2]) & (self.data.harvestWeek == lot_specs[3]) &
+                            (self.data.quality == lot_specs[4]) & (self.data.rating_class == lot_specs[5])]
+                        # print("current_spec_data =", current_spec_data)
+                        df = current_spec_data.sort_values(by=["quantity"], ascending=False)
+                        print("df =", df[['rightId', 'quantity']])
+                        # Rights whose quantity is equal to min_lac_size
+                        exact_df = df[(df["quantity"] == min_lac_size)]
+                        if len(exact_df) > 0:
+                            lot_data.append(int(exact_df["rightId"].iloc[0]))
+                        else:
+                            if existing_quantity < lowerlimit:
+                                min_range = lowerlimit - existing_quantity
+                                max_range = upperlimit - existing_quantity
+                                print("min =", min_range, "max =", max_range)
+                                # Rights whose quantity is in given range
+                                range_df = df[(min_range <= df["quantity"]) & (df["quantity"] <= max_range)]
+                                # print("range_df =", range_df[["rightId", "quantity"]])
+                                if len(range_df) > 0:
+                                    lot_data.append(int(range_df["rightId"].iloc[0]))
+                                else:
+                                    if max_rights > 1:
+                                        list_right = []
+                                        quantity_dict = {}
+                                        list_quantity = []
+                                        comb = []
+                                        for items in df.itertuples():
+                                            if items.quantity in quantity_dict:
+                                                quantity_dict[items.quantity] += [int(items.rightId)]
+                                            else:
+                                                quantity_dict[items.quantity] = [int(items.rightId)]
+                                            list_quantity.append(items.quantity)
+
+                                        # combinations of quantities from 2 quantity upto max_rights
+                                        for n in range(2, max_rights + 1):
+                                            comb.append([i for i in combinations(list_quantity, n)])
+
+                                        combinations_list = [list(x) for xl in comb for x in xl]
+                                        combinations_sumList = [sum(x) for x in combinations_list]
+                                        print("combinations_sumList =", combinations_sumList)
+                                        # quantities combination which serve exact min_lac_size
+                                        exact = combinations_list[combinations_sumList.index(min_lac_size)] \
+                                            if min_lac_size in combinations_sumList else 0
+                                        if exact == 0:
+                                            # quantities combination which is in given range
+                                            range_list = [x for x in combinations_sumList if min_range <= x <= max_range]
+                                            if len(range_list) > 0:
+                                                nearest = range_list[min(range(len(range_list)),
+                                                                         key=lambda x: abs(range_list[x] - min_lac_size))]
+                                                exact = combinations_list[combinations_sumList.index(nearest)] \
+                                                    if nearest in combinations_sumList else 0
+
+                                        elif exact != 0:
+                                            for quantity in exact:
+                                                list_right.append(quantity_dict[quantity][-1])
+                                                del quantity_dict[quantity][-1]
+                                            lot_data.extend(list_right)
+                                            print("exact =", exact, "sum =", sum(exact))
+                                            print("list_right =", list_right)
+                                        else:
+                                            self.errors.append({
+                                                "message": "Sorry we didn't get any rights against required quantity",
+                                                "error": "RGTERR-034"
+                                            })
+                                    else:
+                                        self.errors.append({
+                                            "message": "Maximum Rights Exceeds",
+                                            "error": "RGTERR-032"
+                                        })
                             else:
-                                if len(list_right) > 0 and min_range < sum(list_quantity) <= max_range:
-                                    lot_data.extend(list_right)
-                                    break
+                                self.errors.append({
+                                    "message": "lot_lower_threshold is not Correct",
+                                    "error": "RGTERR-033"
+                                })
                     else:
-                        lot_data.extend(list_right)
+                        self.errors.append({
+                            "message": "Maximum Rights Exceeds",
+                            "error": "RGTERR-032"
+                        })
+                else:
+                    # lot_data = "Lot Details are not Correct"
+                    self.errors.append({
+                        "message": "Lot Quantity is not correct",
+                        "error": "RGTERR-031"
+                    })
 
         else:
-            lotData = lot_rights["rightId"].values.tolist()
+            lot_data = lot_data
 
         result = {
             "lotData": lot_data,
-            "quantityList": list_quantity,
-            "lot_list": lot_list
+            "errors": self.errors
         }
         return result
 
@@ -1189,9 +1245,3 @@ class test_spec:
         dataframe = pd.read_sql(query, self.dbConn)
         json = dataframe.to_dict("records")
         return json
-
-
-
-
-
-
